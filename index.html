@@ -332,16 +332,21 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       var cargo = p[0], reg = p[1], cod = p[2], fdv = p[3], marca = p[4];
       var mai = a[0], ant = a[1], y25 = a[2], y26 = a[3], t25 = a[4], t26 = a[5];
       var mkts = marcaMkt[marca], pMes = 1, pYtd = 1;
+      // numerador (SP0) e denominador (mercado montado) viajam para a base, para que o MKT SHARE
+      // seja campo calculado na dinamica e agregue certo nos subtotais (marca = share Brasil)
+      var sp0Mes = mai, sp0Ytd = y26, mktMes = mai, mktYtd = y26;
       if (mkts) {
         var totM = 0, totY = 0;
         Object.keys(mkts).forEach(function (mk) { var acc = mkt[cargo + '\u0001' + cod + '\u0001' + mk]; if (acc) { totM += acc[0]; totY += acc[1]; } });
         var sa = sp0[cargo + '\u0001' + cod + '\u0001' + marca] || [0, 0];
         pMes = totM > 0 ? sa[0] / totM : null;
         pYtd = totY > 0 ? sa[1] / totY : null;
+        sp0Mes = sa[0]; sp0Ytd = sa[1]; mktMes = totM; mktYtd = totY;
       }
       rows.push({
         cargo: cargo, regional: reg, cod: cod, fdv: fdv, marca: marca,
         mes: mai, ytd: y26, y25: y25, pMes: pMes, pYtd: pYtd,
+        sp0Mes: sp0Mes, sp0Ytd: sp0Ytd, mktMes: mktMes, mktYtd: mktYtd,
         evMes: ant ? (mai - ant) / ant : 0,
         evTri: t25 ? (t26 - t25) / t25 : 0,
         evYtd: y25 ? (y26 - y25) / y25 : 0
@@ -387,11 +392,318 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     return items;
   }
 
+  // ---- 0) clonar a visao da aba RANKING para a aba Ranking YTD ----
+  // Copia a tabela dinamica (campos, formatos, filtros, formatacao condicional), o layout da
+  // planilha (colunas, ranks, gridlines), as 4 segmentacoes e suas caches, trocando apenas a
+  // chave de ordenacao para o YTD. Assim as duas abas ficam identicas, mudando so o criterio.
+  function guid(){ var h='0123456789ABCDEF', s=''; for(var i=0;i<32;i++){ s+=h[Math.floor(Math.random()*16)]; if(i===7||i===11||i===15||i===19) s+='-'; } return '{'+s+'}'; }
+  function reEsc(s){ return s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'); }
+  function normPath(t, base){ t=t.replace(/^\//,''); if(t.indexOf('xl/')===0) return t; if(t.indexOf('../')===0) return 'xl/'+t.substring(3); return (base||'xl/')+t; }
+  function relsOf(xml){ var out=[], re=/<Relationship\b([^>]*)\/>/g, m; while((m=re.exec(xml))){ var a=m[1]; var id=(a.match(/Id="([^"]+)"/)||[])[1], ty=(a.match(/Type="([^"]+)"/)||[])[1], tg=(a.match(/Target="([^"]+)"/)||[])[1]; out.push({id:id,type:ty,target:tg,raw:m[0]}); } return out; }
+  function sheetRelsPath(sheetPath){ var i=sheetPath.lastIndexOf('/'); return sheetPath.substring(0,i)+'/_rels/'+sheetPath.substring(i+1)+'.rels'; }
+
+  function colLetter(n){ var s=''; while(n>0){ var r=(n-1)%26; s=String.fromCharCode(65+r)+s; n=Math.floor((n-1)/26); } return s; }
+  function colNum(s){ var n=0; for(var i=0;i<s.length;i++) n=n*26+(s.charCodeAt(i)-64); return n; }
+
+  // Mantem na dinamica so os campos de valor em keepFlds (indices de cacheField), reindexando
+  // formatos, formatacao condicional, colItems e autoSort. Devolve {xml, oldIdx} (indices antigos mantidos).
+  function restrictDataFields(xml, keepFlds, sortFld){
+    var dfBlock=xml.match(/<dataFields count="\d+">([\s\S]*?)<\/dataFields>/); if(!dfBlock) return {xml:xml, oldIdx:null};
+    var dfs=dfBlock[1].match(/<dataField\b[^>]*\/>/g)||[];
+    var keep=[], map={}, dropFld={};
+    dfs.forEach(function(d,i){ var fld=parseInt(d.match(/\bfld="(\d+)"/)[1],10); if(keepFlds.indexOf(fld)!==-1){ map[i]=keep.length; keep.push({xml:d,fld:fld,old:i}); } else dropFld[fld]=true; });
+    if(keep.length===dfs.length) return {xml:xml, oldIdx:keep.map(function(k){return k.old;})};
+    xml=xml.replace(dfBlock[0], '<dataFields count="'+keep.length+'">'+keep.map(function(k){return k.xml;}).join('')+'</dataFields>');
+    // pivotFields: tirar dataField="1" dos campos descartados (ordem = indice do cacheField)
+    var pi=0;
+    xml=xml.replace(/<pivotField\b[^>]*?(?:\/>|>[\s\S]*?<\/pivotField>)/g, function(block){ var idx=pi++; if(dropFld[idx]) block=block.replace(/ dataField="1"/,''); return block; });
+    // colItems
+    var ci='<colItems count="'+keep.length+'"><i><x/></i>'; for(var k=1;k<keep.length;k++) ci+='<i i="'+k+'"><x v="'+k+'"/></i>'; ci+='</colItems>';
+    xml=xml.replace(/<colItems count="\d+">[\s\S]*?<\/colItems>/, ci);
+    // referencias ao eixo de valores (field 4294967294)
+    function remapRef(ref){
+      var xs=ref.match(/<x v="\d+"\/>/g)||[], nx=[];
+      xs.forEach(function(x){ var v=parseInt(x.match(/\d+/)[0],10); if(map[v]!==undefined) nx.push('<x v="'+map[v]+'"/>'); });
+      if(!nx.length) return null;
+      return ref.replace(/count="\d+"/,'count="'+nx.length+'"').replace(/(<reference\b[^>]*>)[\s\S]*?(<\/reference>)/, '$1'+nx.join('')+'$2');
+    }
+    function fixArea(area){ var dead=false; var out=area.replace(/<reference field="4294967294"[^>]*>[\s\S]*?<\/reference>/g, function(ref){ var r=remapRef(ref); if(r===null){ dead=true; return ''; } return r; }); return dead?null:out; }
+    var nFmt=0;
+    xml=xml.replace(/<formats count="\d+">([\s\S]*?)<\/formats>/, function(_,body){
+      var out=body.replace(/<format\b[^>]*>[\s\S]*?<\/format>/g, function(f){ var r=fixArea(f); if(r===null) return ''; nFmt++; return r; });
+      return '<formats count="'+nFmt+'">'+out+'</formats>';
+    });
+    var nCf=0;
+    xml=xml.replace(/<conditionalFormats count="\d+">([\s\S]*?)<\/conditionalFormats>/, function(_,body){
+      var out=body.replace(/<conditionalFormat\b[^>]*>[\s\S]*?<\/conditionalFormat>/g, function(f){ var r=fixArea(f); if(r===null) return ''; nCf++; return r; });
+      return nCf?'<conditionalFormats count="'+nCf+'">'+out+'</conditionalFormats>':'';
+    });
+    // autoSort: pela nova posicao do campo pedido (ou o primeiro mantido)
+    var sortIdx=0; keep.forEach(function(k,i){ if(k.fld===sortFld) sortIdx=i; });
+    xml=xml.replace(/<autoSortScope>[\s\S]*?<\/autoSortScope>/g, function(block){ return block.replace(/(<reference field="4294967294" count="1"[^>]*><x v=")\d+("\/>)/, '$1'+sortIdx+'$2'); });
+    // location: B3:G40 -> encolhe o fim
+    xml=xml.replace(/<location ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"/, function(_,c1,r1,c2,r2){ return '<location ref="'+c1+r1+':'+colLetter(colNum(c1)+keep.length)+r2+'"'; });
+    return {xml:xml, oldIdx:keep.map(function(k){return k.old;})};
+  }
+
+  // Na planilha, mantem a coluna de rotulos e so as colunas de valor em oldIdx (0-based a partir de firstDataCol),
+  // renumerando-as para a esquerda. Remove as demais celulas.
+  function restrictSheetCols(xml, firstDataCol, totalData, oldIdx){
+    var first=colNum(firstDataCol), colMap={}, drop={};
+    for(var i=0;i<totalData;i++){ var o=first+i, k=oldIdx.indexOf(i); if(k===-1) drop[o]=true; else colMap[o]=first+k; }
+    var lastCol=first+oldIdx.length-1;
+    xml=xml.replace(/<sheetData>([\s\S]*?)<\/sheetData>/, function(_,body){
+      body=body.replace(/<c r="([A-Z]+)(\d+)"[^>]*?(?:\/>|>[\s\S]*?<\/c>)/g, function(cell,c,r){ var n=colNum(c); if(drop[n]) return ''; if(colMap[n]!==undefined) return cell.replace(/<c r="[A-Z]+\d+"/, '<c r="'+colLetter(colMap[n])+r+'"'); return cell; });
+      body=body.replace(/spans="(\d+):(\d+)"/g, function(_,a,b){ return 'spans="'+a+':'+Math.min(parseInt(b,10),lastCol)+'"'; });
+      return '<sheetData>'+body+'</sheetData>';
+    });
+    xml=xml.replace(/<dimension ref="([A-Z]+\d+):([A-Z]+)(\d+)"\/>/, function(_,a,c,r){ return '<dimension ref="'+a+':'+colLetter(Math.min(colNum(c),lastCol))+r+'"/>'; });
+    xml=xml.replace(/sqref="([A-Z]+)(\d+):([A-Z]+)(\d+)"/g, function(m,c1,r1,c2,r2){ var n=colNum(c1); if(colMap[n]!==undefined) return 'sqref="'+colLetter(colMap[n])+r1+':'+colLetter(colMap[colNum(c2)]||colMap[n])+r2+'"'; return m; });
+    // larguras: reaproveita a definicao da coluna de origem para a nova posicao
+    xml=xml.replace(/<cols>([\s\S]*?)<\/cols>/, function(_,body){
+      var defs=body.match(/<col\b[^>]*\/>/g)||[], out=[];
+      defs.forEach(function(d){ var mn=parseInt(d.match(/min="(\d+)"/)[1],10); if(mn<first){ out.push(d); return; } if(drop[mn]) return; var nn=colMap[mn]; if(nn===undefined){ if(mn>first+totalData-1){ nn=mn-(totalData-oldIdx.length); } else return; } out.push(d.replace(/min="\d+"/,'min="'+nn+'"').replace(/max="\d+"/,'max="'+nn+'"')); });
+      return '<cols>'+out.join('')+'</cols>';
+    });
+    return xml;
+  }
+
+  function shiftDrawingCols(xml, delta){ return xml.replace(/<xdr:col>(\d+)<\/xdr:col>/g, function(_,v){ return '<xdr:col>'+Math.max(0,parseInt(v,10)+delta)+'</xdr:col>'; }); }
+
+
+  // Migra uma dinamica do molde antigo (13 campos) para o cache novo (19 campos):
+  // 4 medidas novas (SP0/MKT mes e YTD) entram antes dos calculados; EVOL YTD vai de 12 para 16;
+  // MKT SHARE passa a usar os calculados 17 (mes) e 18 (YTD) em vez das colunas 6 e 8.
+  // Tambem remove os formatos que escondiam (cinza) o share nos subtotais da marca, que agora e valido.
+  function upgradeShareFields(xml){
+    var m=xml.match(/<pivotFields count="(\d+)">([\s\S]*?)<\/pivotFields>/); if(!m||m[1]!=='13') return xml;
+    var blocks=m[2].match(/<pivotField\b[^>]*?(?:\/>|>[\s\S]*?<\/pivotField>)/g)||[]; if(blocks.length!==13) return xml;
+    blocks[6]=blocks[6].replace(/ dataField="1"/,''); blocks[8]=blocks[8].replace(/ dataField="1"/,'');
+    var nb=blocks.slice(0,12);
+    for(var i=0;i<4;i++) nb.push('<pivotField showAll="0"/>');
+    nb.push(blocks[12]);
+    nb.push('<pivotField dataField="1" showAll="0"/>','<pivotField dataField="1" showAll="0"/>');
+    xml=xml.replace(m[0], '<pivotFields count="'+nb.length+'">'+nb.join('')+'</pivotFields>');
+    var fldMap={'12':'16','6':'17','8':'18'};
+    xml=xml.replace(/<dataField\b[^>]*\/>/g, function(d){ return d.replace(/\bfld="(\d+)"/, function(_,v){ return 'fld="'+(fldMap[v]||v)+'"'; }); });
+    xml=xml.replace(/<formats count="\d+">([\s\S]*?)<\/formats>/, function(_,body){
+      var n=0; var out=body.replace(/<format\b[^>]*>[\s\S]*?<\/format>/g, function(f){
+        if(/<reference field="4294967294" count="1" selected="0"><x v="[13]"\/><\/reference><reference field="4" count="0"\/>/.test(f)) return '';
+        n++; return f; });
+      return '<formats count="'+n+'">'+out+'</formats>';
+    });
+    return xml;
+  }
+
+
+  // Destaque de cor nas linhas das marcas (subtotal do campo MARCA, rotulo + valores) em todas as dinamicas.
+  // Cria um dxf de preenchimento em styles.xml (se ainda nao existir) e acrescenta formatos no fim
+  // do bloco <formats>, para prevalecerem sobre os anteriores.
+  async function highlightMarcaRows(zip, rgb){
+    var stPath='xl/styles.xml'; var st=await zip.file(stPath).async('string');
+    var dxf='<dxf><fill><patternFill patternType="solid"><bgColor rgb="'+rgb+'"/></patternFill></fill></dxf>';
+    var dm=st.match(/<dxfs count="(\d+)">([\s\S]*?)<\/dxfs>/); if(!dm) return;
+    var list=dm[2].match(/<dxf\b[^>]*\/>|<dxf\b[^>]*>[\s\S]*?<\/dxf>/g)||[];
+    var id=list.indexOf(dxf);
+    if(id===-1){ id=list.length; st=st.replace(dm[0], '<dxfs count="'+(id+1)+'">'+dm[2]+dxf+'</dxfs>'); zip.file(stPath, st); }
+    var area='<references count="1"><reference field="4" count="0"/></references></pivotArea></format>';
+    var fData='<format dxfId="'+id+'"><pivotArea collapsedLevelsAreSubtotals="1" fieldPosition="0">'+area;
+    var fLabel='<format dxfId="'+id+'"><pivotArea dataOnly="0" labelOnly="1" fieldPosition="0">'+area;
+    var pts=Object.keys(zip.files).filter(function(p){return /^xl\/pivotTables\/pivotTable\d+\.xml$/.test(p);});
+    for(var i=0;i<pts.length;i++){
+      var x=await zip.file(pts[i]).async('string');
+      if(x.indexOf(fData)!==-1) continue;
+      if(/<formats count="\d+">/.test(x)) x=x.replace(/<formats count="(\d+)">([\s\S]*?)<\/formats>/, function(_,c,body){ return '<formats count="'+(parseInt(c,10)+2)+'">'+body+fData+fLabel+'</formats>'; });
+      else x=x.replace(/(<\/dataFields>)/, '$1<formats count="2">'+fData+fLabel+'</formats>');
+      zip.file(pts[i], x);
+    }
+  }
+
+
+  // Garante que exista a aba dstName; se nao existir, cria-a com dinamica, desenho e segmentacoes
+  // copiados de srcName (o cloneRankingView depois sobrescreve o conteudo). Registra no workbook,
+  // nos rels e no [Content_Types].
+  async function ensureSheetLike(zip, srcName, dstName){
+    var wb=await zip.file('xl/workbook.xml').async('string');
+    if(new RegExp('<sheet\\b[^>]*\\bname="'+reEsc(esc(dstName))+'"').test(wb)) return true;
+    var wbRelsXml=await zip.file('xl/_rels/workbook.xml.rels').async('string');
+    var wbRels=relsOf(wbRelsXml), relById={}; wbRels.forEach(function(r){relById[r.id]=r;});
+    var srcM=null, re=/<sheet\b([^>]*)\/>/g, m;
+    while((m=re.exec(wb))){ var nm=unesc((m[1].match(/name="([^"]*)"/)||[])[1]||''); if(nm===srcName) srcM=m; }
+    if(!srcM) return false;
+    var srcPath=normPath(relById[(srcM[1].match(/r:id="([^"]+)"/)||[])[1]].target);
+    var srcRelsPath=sheetRelsPath(srcPath); var srf=zip.file(srcRelsPath); if(!srf) return false;
+    var srcRels=relsOf(await srf.async('string'));
+    function nextNum(prefix, suffix){ var mx=0; Object.keys(zip.files).forEach(function(p){ var mm=p.match(new RegExp('^'+reEsc(prefix)+'(\\d+)'+reEsc(suffix)+'$')); if(mm) mx=Math.max(mx,parseInt(mm[1],10)); }); return mx+1; }
+    var maxSheetId=0; wb.replace(/sheetId="(\d+)"/g, function(_,v){ maxSheetId=Math.max(maxSheetId,parseInt(v,10)); return _; });
+    var maxRid=0; wbRels.forEach(function(r){ maxRid=Math.max(maxRid,parseInt(r.id.replace('rId',''),10)); });
+    var ct=await zip.file('[Content_Types].xml').async('string');
+    function addCT(path, type){ if(ct.indexOf('PartName="/'+path+'"')===-1) ct=ct.replace('</Types>','<Override PartName="/'+path+'" ContentType="'+type+'"/></Types>'); }
+    // partes novas
+    var newSheet='xl/worksheets/sheet'+nextNum('xl/worksheets/sheet','.xml')+'.xml';
+    var newRels=[]; var newRelsXml='<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">';
+    for(var i=0;i<srcRels.length;i++){
+      var r=srcRels[i], tS=normPath(r.target,'xl/worksheets/'), tD=null, content=await zip.file(tS).async('string');
+      if(/pivotTable$/.test(r.type)){ tD='xl/pivotTables/pivotTable'+nextNum('xl/pivotTables/pivotTable','.xml')+'.xml';
+        content=content.replace(/xr:uid="[^"]+"/, 'xr:uid="'+guid()+'"'); zip.file(tD, content);
+        var prf=zip.file(sheetRelsPath(tS)); if(prf) zip.file(sheetRelsPath(tD), await prf.async('string'));
+        addCT(tD,'application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml');
+      } else if(/\/drawing$/.test(r.type)){ tD='xl/drawings/drawing'+nextNum('xl/drawings/drawing','.xml')+'.xml'; zip.file(tD, content);
+        addCT(tD,'application/vnd.openxmlformats-officedocument.drawing+xml');
+      } else if(/\/slicer$/.test(r.type)){ tD='xl/slicers/slicer'+nextNum('xl/slicers/slicer','.xml')+'.xml';
+        // sem segmentacoes ainda: o cloneRankingView cria as da aba com caches proprias (sufixo novo)
+        zip.file(tD, content.replace(/<slicer\b[^>]*\/>/g,''));
+        addCT(tD,'application/vnd.ms-excel.slicer+xml');
+      }
+      if(tD) newRelsXml+=r.raw.replace(/Target="[^"]+"/, 'Target="../'+tD.substring(3)+'"'); else newRelsXml+=r.raw;
+    }
+    newRelsXml+='</Relationships>';
+    var sh=await zip.file(srcPath).async('string');
+    sh=sh.replace(/ tabSelected="1"/,'').replace(/xr:uid="[^"]+"/, 'xr:uid="'+guid()+'"');
+    zip.file(newSheet, sh); zip.file(sheetRelsPath(newSheet), newRelsXml);
+    addCT(newSheet,'application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml');
+    // workbook: aba logo depois da origem, com sheetId e rId novos
+    var rid='rId'+(maxRid+1);
+    wbRelsXml=wbRelsXml.replace('</Relationships>','<Relationship Id="'+rid+'" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="'+newSheet.substring(3)+'"/></Relationships>');
+    wb=wb.replace(srcM[0], srcM[0]+'<sheet name="'+esc(dstName)+'" sheetId="'+(maxSheetId+1)+'" r:id="'+rid+'"/>');
+    zip.file('xl/workbook.xml', wb); zip.file('xl/_rels/workbook.xml.rels', wbRelsXml); zip.file('[Content_Types].xml', ct);
+    return true;
+  }
+
+  async function cloneRankingView(zip, srcName, dstName, opts){
+    opts=opts||{}; var keepFlds=opts.keepFlds||null, sortFld=opts.sortFld;
+    var wb=await zip.file('xl/workbook.xml').async('string');
+    var wbRelsXml=await zip.file('xl/_rels/workbook.xml.rels').async('string');
+    var wbRels=relsOf(wbRelsXml), relById={}; wbRels.forEach(function(r){relById[r.id]=r;});
+    function sheetInfo(name){
+      var re=/<sheet\b([^>]*)\/>/g, m;
+      while((m=re.exec(wb))){ var a=m[1]; var nm=unesc((a.match(/name="([^"]*)"/)||[])[1]||'');
+        if(nm===name){ var rid=(a.match(/r:id="([^"]+)"/)||[])[1]; var sid=(a.match(/sheetId="(\d+)"/)||[])[1];
+          return {name:nm, sheetId:sid, path:normPath(relById[rid].target)}; } }
+      return null;
+    }
+    var src=sheetInfo(srcName), dst=sheetInfo(dstName);
+    if(!src||!dst) return false;
+    async function parts(info){
+      var rp=sheetRelsPath(info.path); var f=zip.file(rp); if(!f) return null;
+      var rx=await f.async('string'); var rels=relsOf(rx); var o={relsPath:rp, relsXml:rx, rels:rels};
+      rels.forEach(function(r){ var t=normPath(r.target,'xl/worksheets/');
+        if(/pivotTable$/.test(r.type)) o.pivot=t; else if(/\/drawing$/.test(r.type)) o.drawing=t; else if(/\/slicer$/.test(r.type)) o.slicer=t; });
+      return o;
+    }
+    var S=await parts(src), D=await parts(dst);
+    if(!S||!D||!S.pivot||!D.pivot) return false;
+
+    // --- tabela dinamica: copia integral, muda uid e a chave do autoSort ---
+    var ptS=await zip.file(S.pivot).async('string'), ptD=await zip.file(D.pivot).async('string');
+    var uidD=(ptD.match(/xr:uid="([^"]+)"/)||[])[1];
+    var ptN=ptS;
+    if(uidD) ptN=ptN.replace(/xr:uid="[^"]+"/, 'xr:uid="'+uidD+'"');
+    var totalData=(ptN.match(/<dataField\b/g)||[]).length, oldIdx=null;
+    var firstDataCol=colLetter(colNum(ptN.match(/<location ref="([A-Z]+)\d+/)[1])+1);
+    if(keepFlds){ var rd=restrictDataFields(ptN, keepFlds, sortFld); ptN=rd.xml; oldIdx=rd.oldIdx; }
+    else if(sortFld!==undefined){
+      var sIdx=0; (ptN.match(/<dataField\b[^>]*\/>/g)||[]).forEach(function(d,i){ if(parseInt(d.match(/\bfld="(\d+)"/)[1],10)===sortFld) sIdx=i; });
+      ptN=ptN.replace(/<autoSortScope>[\s\S]*?<\/autoSortScope>/g, function(block){ return block.replace(/(<reference field="4294967294" count="1"[^>]*><x v=")\d+("\/>)/, '$1'+sIdx+'$2'); });
+    }
+    var removed=oldIdx?totalData-oldIdx.length:0;
+    zip.file(D.pivot, ptN);
+
+    // --- planilha: copia integral do layout, mantendo uid da aba destino e sem tabSelected ---
+    var shS=await zip.file(src.path).async('string'), shD=await zip.file(dst.path).async('string');
+    var shUid=(shD.match(/xr:uid="([^"]+)"/)||[])[1];
+    var shN=shS.replace(/ tabSelected="1"/,'');
+    if(shUid) shN=shN.replace(/xr:uid="[^"]+"/, 'xr:uid="'+shUid+'"');
+    if(oldIdx && removed) shN=restrictSheetCols(shN, firstDataCol, totalData, oldIdx);
+    zip.file(dst.path, shN);
+    // rels da aba destino: mesmos Ids da origem, alvos da propria aba destino
+    var dstByType={}; D.rels.forEach(function(r){dstByType[r.type]=r.target;});
+    var relsN=S.relsXml.replace(/<Relationship\b[^>]*\/>/g, function(raw){
+      var ty=(raw.match(/Type="([^"]+)"/)||[])[1]; var tg=dstByType[ty];
+      return tg?raw.replace(/Target="[^"]+"/, 'Target="'+tg+'"'):raw;
+    });
+    zip.file(D.relsPath, relsN);
+
+    // --- segmentacoes: nome "X" -> "X 1", cache "C" -> "C1" ---
+    if(S.slicer && S.drawing){
+      var slS=await zip.file(S.slicer).async('string');
+      // sufixo numerico da aba destino: o que ela ja usa (ex.: CARGO1) ou o proximo livre
+      function baseName(n){ return n.replace(/ \d+$/,''); } function baseCache(c){ return c.replace(/\d+$/,''); }
+      var sufx=null;
+      if(D.slicer && zip.file(D.slicer)){ var slD0=await zip.file(D.slicer).async('string'); var cm=slD0.match(/\bcache="([^"]+)"/); if(cm){ var dm=cm[1].match(/(\d+)$/); if(dm) sufx=parseInt(dm[1],10); } }
+      if(sufx===null){ var used=[]; Object.keys(zip.files).forEach(function(p){ if(/^xl\/slicerCaches\/slicerCache\d+\.xml$/.test(p)) used.push(p); });
+        var mx=0; for(var ui=0;ui<used.length;ui++){ var ux=await zip.file(used[ui]).async('string'); var un=(ux.match(/<slicerCacheDefinition\b[^>]*\bname="([^"]+)"/)||[])[1]||''; var dmm=un.match(/(\d+)$/); if(dmm) mx=Math.max(mx,parseInt(dmm[1],10)); }
+        sufx=mx+1; }
+      var nameMap={}, cacheMap={};
+      slS.replace(/<slicer\b[^>]*\bname="([^"]+)"[^>]*\bcache="([^"]+)"/g, function(_,n,c){ nameMap[n]=baseName(n)+' '+sufx; cacheMap[c]=baseCache(c)+sufx; return _; });
+      var slN=slS.replace(/<slicer\b[^>]*\/>/g, function(tag){
+        return tag.replace(/\bname="([^"]+)"/, function(_,n){return 'name="'+(nameMap[n]||n)+'"';})
+                  .replace(/\bcache="([^"]+)"/, function(_,c){return 'cache="'+(cacheMap[c]||c)+'"';})
+                  .replace(/xr10:uid="[^"]+"/, 'xr10:uid="'+guid()+'"');
+      });
+      if(D.slicer) zip.file(D.slicer, slN);
+      // desenho: mesmas ancoras/tamanhos, nomes mapeados, creationIds novos
+      var drS=await zip.file(S.drawing).async('string');
+      var drN=drS.replace(/\bname="([^"]*)"/g, function(_,n){ return 'name="'+(nameMap[n]||n)+'"'; })
+                 .replace(/(<a16:creationId[^>]*\bid=")[^"]+(")/g, function(_,a,b){ return a+guid()+b; });
+      if(removed) drN=shiftDrawingCols(drN, -removed);
+      if(D.drawing) zip.file(D.drawing, drN);
+      // caches: para cada cache da origem, cria/sobrescreve a da destino
+      var scPaths=Object.keys(zip.files).filter(function(p){return /^xl\/slicerCaches\/slicerCache\d+\.xml$/.test(p);});
+      var byName={};
+      for(var i=0;i<scPaths.length;i++){ var x=await zip.file(scPaths[i]).async('string'); var nm=(x.match(/<slicerCacheDefinition\b[^>]*\bname="([^"]+)"/)||[])[1]; if(nm) byName[nm]={path:scPaths[i], xml:x}; }
+      var maxN=0; scPaths.forEach(function(p){ var n=parseInt(p.match(/slicerCache(\d+)\.xml$/)[1],10); if(n>maxN) maxN=n; });
+      var maxRid=0; wbRels.forEach(function(r){ var n=parseInt(r.id.replace('rId',''),10); if(n>maxRid) maxRid=n; });
+      var ct=await zip.file('[Content_Types].xml').async('string');
+      var newRels='', newExt='', newNames='';
+      var srcCaches=Object.keys(cacheMap);
+      for(var k=0;k<srcCaches.length;k++){
+        var cS=srcCaches[k], cD=cacheMap[cS]; if(!byName[cS]) continue;
+        var body=byName[cS].xml
+          .replace(/(<slicerCacheDefinition\b[^>]*\bname=")[^"]+(")/, '$1'+cD+'$2')
+          .replace(/tabId="\d+"/g, 'tabId="'+dst.sheetId+'"');
+        if(byName[cD]){
+          var oldUid=(byName[cD].xml.match(/xr10:uid="([^"]+)"/)||[])[1];
+          if(oldUid) body=body.replace(/xr10:uid="[^"]+"/, 'xr10:uid="'+oldUid+'"');
+          zip.file(byName[cD].path, body);
+        } else {
+          body=body.replace(/xr10:uid="[^"]+"/, 'xr10:uid="'+guid()+'"');
+          maxN++; maxRid++;
+          var p='xl/slicerCaches/slicerCache'+maxN+'.xml';
+          zip.file(p, body);
+          newRels+='<Relationship Id="rId'+maxRid+'" Type="http://schemas.microsoft.com/office/2007/relationships/slicerCache" Target="slicerCaches/slicerCache'+maxN+'.xml"/>';
+          newExt+='<x14:slicerCache r:id="rId'+maxRid+'"/>';
+          if(wb.indexOf('name="'+cD+'"')===-1) newNames+='<definedName name="'+cD+'">#N/A</definedName>';
+          if(ct.indexOf('/'+p)===-1) ct=ct.replace('</Types>','<Override PartName="/'+p+'" ContentType="application/vnd.ms-excel.slicerCache+xml"/></Types>');
+        }
+      }
+      if(newRels){
+        wbRelsXml=wbRelsXml.replace('</Relationships>', newRels+'</Relationships>');
+        zip.file('xl/_rels/workbook.xml.rels', wbRelsXml);
+        wb=wb.replace(/<\/x14:slicerCaches>/, newExt+'</x14:slicerCaches>');
+        if(newNames){ if(wb.indexOf('</definedNames>')!==-1) wb=wb.replace('</definedNames>', newNames+'</definedNames>'); else wb=wb.replace(/<\/sheets>/, '</sheets><definedNames>'+newNames+'</definedNames>'); }
+        zip.file('xl/workbook.xml', wb);
+        zip.file('[Content_Types].xml', ct);
+      }
+    }
+    return true;
+  }
+
   async function build(moldeBuf, base, JSZipRef, progress){
     progress=progress||function(){};
     var JSZ=JSZipRef||(typeof JSZip!=='undefined'?JSZip:null);
     var zip=await JSZ.loadAsync(moldeBuf);
     progress('Abrindo molde',10);
+    // migrar as dinamicas do molde para o cache de 19 campos (share como campo calculado)
+    var ptAll=Object.keys(zip.files).filter(function(p){return /^xl\/pivotTables\/pivotTable\d+\.xml$/.test(p);});
+    for(var pu=0;pu<ptAll.length;pu++){ var pux=await zip.file(ptAll[pu]).async('string'); zip.file(ptAll[pu], upgradeShareFields(pux)); }
+    // linhas das marcas com fundo destacado
+    try{ await highlightMarcaRows(zip, 'FFFFF2CC'); }catch(e){ console.warn('highlightMarcaRows', e); }
+    // aba Ranking YTD = mesma configuracao da aba RANKING, mas so com os valores de YTD
+    // (cacheFields 7=YTD, 18=Share YTD, 16=EVOL YTD; ordena pelo 7)
+    try{ await cloneRankingView(zip, 'RANKING', 'Ranking YTD', {keepFlds:[7,18,16], sortFld:7}); }catch(e){ console.warn('cloneRankingView', e); }
+    // terceira aba: mesma apresentacao da Ranking YTD, ordenada pelo MKT SHARE YTD (campo calculado 18)
+    try{ if(await ensureSheetLike(zip, 'Ranking YTD', 'Ranking Share YTD')) await cloneRankingView(zip, 'Ranking YTD', 'Ranking Share YTD', {sortFld:18}); }catch(e){ console.warn('Ranking Share YTD', e); }
 
     var rows=base.rows;
     // ---- 1) mapear dims para indices (reaproveita ordem do molde) ----
@@ -435,7 +747,12 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       {n:'PART. YTD',f:function(r){return r.pYtd;},int:false},
       {n:'Evol. Mês',f:function(r){return r.evMes;},int:false},
       {n:'Evol. TRI',f:function(r){return r.evTri;},int:false},
-      {n:'YTD 25',f:function(r){return r.y25;},int:true}
+      {n:'YTD 25',f:function(r){return r.y25;},int:true},
+      // numerador/denominador do share (SP0 e mercado montado), mes e YTD
+      {n:'SP0 mai/26',f:function(r){return r.sp0Mes;},int:true},
+      {n:'MKT mai/26',f:function(r){return r.mktMes;},int:false},
+      {n:'SP0 YTD',f:function(r){return r.sp0Ytd;},int:true},
+      {n:'MKT YTD',f:function(r){return r.mktYtd;},int:false}
     ];
     function measXml(mo){
       var mn=Infinity,mx=-Infinity;
@@ -444,15 +761,76 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       var attrs=' containsSemiMixedTypes="0" containsString="0" containsNumber="1"'+(mo.int?' containsInteger="1"':'')+' minValue="'+(mo.int?Math.round(mn):mn)+'" maxValue="'+(mo.int?Math.round(mx):mx)+'"';
       return '<cacheField name="'+esc(mo.n)+'" numFmtId="0"><sharedItems'+attrs+'/></cacheField>';
     }
-    var fieldsXml=dimNames.map(sharedXml).join('')+meas.map(measXml).join('')+
-      '<cacheField name="EVOL YTD" numFmtId="0" formula="IFERROR(\'YTD mai/26\'/\'YTD 25\'-1,0)" databaseField="0"/>';
+    var calcXml='<cacheField name="EVOL YTD" numFmtId="0" formula="IFERROR(\'YTD mai/26\'/\'YTD 25\'-1,0)" databaseField="0"/>'+
+      '<cacheField name="Share mai/26" numFmtId="0" formula="IFERROR(\'SP0 mai/26\'/\'MKT mai/26\',0)" databaseField="0"/>'+
+      '<cacheField name="Share YTD" numFmtId="0" formula="IFERROR(\'SP0 YTD\'/\'MKT YTD\',0)" databaseField="0"/>';
+    var fieldsXml=dimNames.map(sharedXml).join('')+meas.map(measXml).join('')+calcXml;
+    var nFields=dimNames.length+meas.length+3; // 19
     // trocar bloco de cacheFields e recordCount + refreshOnLoad
-    cd=cd.replace(/<cacheFields count="\d+">[\s\S]*<\/cacheFields>/,'<cacheFields count="13">'+fieldsXml+'</cacheFields>');
+    cd=cd.replace(/<cacheFields count="\d+">[\s\S]*<\/cacheFields>/,'<cacheFields count="'+nFields+'">'+fieldsXml+'</cacheFields>');
     cd=cd.replace(/recordCount="\d+"/,'recordCount="'+rows.length+'"');
     if(cd.indexOf('refreshOnLoad')===-1) cd=cd.replace('<pivotCacheDefinition ','<pivotCacheDefinition refreshOnLoad="1" ');
     else cd=cd.replace(/refreshOnLoad="\d+"/,'refreshOnLoad="1"');
     zip.file(cdPath,cd);
     progress('Cache remontado',45);
+
+    // ---- 2b) sincronizar itens enumerados das tabelas dinamicas e segmentacoes com o cache ----
+    // O molde enumera <item x="i"/> para cada valor do cache. Quando o mes traz FDVs/marcas
+    // novos, o cache cresce mas a enumeracao fica curta e o Excel descarta a tabela dinamica
+    // ("Parte Removida: /xl/pivotTables/pivotTableN.xml"). Aqui completamos os indices que faltam.
+    function syncItems(xml, countPerField){
+      // percorre os pivotField na ordem; countPerField[i] = tamanho do cache do campo i (ou undefined)
+      var out='', pos=0, idx=0, re=/<pivotField\b[^>]*?(\/>|>[\s\S]*?<\/pivotField>)/g, m;
+      while((m=re.exec(xml))){
+        var block=m[0], n=countPerField[idx];
+        if(n!==undefined && block.indexOf('<items ')!==-1){
+          block=block.replace(/<items count="\d+">([\s\S]*?)<\/items>/, function(all, body){
+            var seen={}, rx=/<item\b[^>]*\bx="(\d+)"/g, mm;
+            while((mm=rx.exec(body))) seen[mm[1]]=true;
+            // se o campo esta filtrado (ha itens ocultos), o item novo nasce oculto tambem;
+            // se nao ha filtro, nasce visivel. Mantem a dinamica coerente com a segmentacao.
+            var filtered=/<item\b[^>]*\bh="1"/.test(body);
+            var add='';
+            for(var i=0;i<n;i++) if(!seen[i]) add+=filtered?'<item h="1" x="'+i+'"/>':'<item x="'+i+'"/>';
+            var dflt=body.indexOf('<item t="default"/>');
+            var nb = dflt===-1 ? body+add : body.substring(0,dflt)+add+body.substring(dflt);
+            var total=(nb.match(/<item\b/g)||[]).length;
+            return '<items count="'+total+'">'+nb+'</items>';
+          });
+        }
+        out+=xml.substring(pos,m.index)+block; pos=m.index+m[0].length; idx++;
+      }
+      return out+xml.substring(pos);
+    }
+    var dimCounts=dimNames.map(function(nm){return lists[nm].length;});
+    var ptPaths=Object.keys(zip.files).filter(function(p){return /^xl\/pivotTables\/pivotTable\d+\.xml$/.test(p);});
+    for(var pi=0;pi<ptPaths.length;pi++){
+      var ptx=await zip.file(ptPaths[pi]).async('string');
+      zip.file(ptPaths[pi], syncItems(ptx, dimCounts));
+    }
+    // segmentacoes (slicerCache): <i x="k"/> dentro de <items count="..">
+    var scPaths=Object.keys(zip.files).filter(function(p){return /^xl\/slicerCaches\/slicerCache\d+\.xml$/.test(p);});
+    for(var si=0;si<scPaths.length;si++){
+      var scx=await zip.file(scPaths[si]).async('string');
+      var srcM=scx.match(/sourceName="([^"]+)"/);
+      var src=srcM?unesc(srcM[1]):null;
+      if(!src || !lists[src]) continue;
+      var n=lists[src].length;
+      scx=scx.replace(/<items count="\d+">([\s\S]*?)<\/items>/, function(all, body){
+        var seen={}, rx=/<i\b([^>]*)\/>/g, mm, tot=0, sel=0;
+        while((mm=rx.exec(body))){ var xv=(mm[1].match(/\bx="(\d+)"/)||[])[1]; if(xv===undefined) continue; seen[xv]=true; tot++; if(/\bs="1"/.test(mm[1])) sel++; }
+        // s="1" = item selecionado. Sem filtro (todos selecionados) o item novo entra selecionado;
+        // com selecao parcial entra desmarcado, igual ao h="1" da dinamica.
+        var allSel=tot>0&&sel===tot;
+        var add='';
+        for(var i=0;i<n;i++) if(!seen[i]) add+=allSel?'<i x="'+i+'" s="1"/>':'<i x="'+i+'"/>';
+        var nb=body+add;
+        var total=(nb.match(/<i\b/g)||[]).length;
+        return '<items count="'+total+'">'+nb+'</items>';
+      });
+      zip.file(scPaths[si], scx);
+    }
+    progress('Itens das dinamicas sincronizados',50);
 
     // ---- 3) records ----
     var recParts=['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n<pivotCacheRecords xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="xr" xmlns:xr="http://schemas.microsoft.com/office/spreadsheetml/2014/revision" count="'+rows.length+'">'];
@@ -485,24 +863,32 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       cells+='<c r="C'+rn+'"><v>'+r.cod+'</v></c>';
       cells+='<c r="D'+rn+'" t="inlineStr"><is><t>'+esc(r.fdv)+'</t></is></c>';
       cells+='<c r="E'+rn+'" t="inlineStr"><is><t>'+esc(r.marca)+'</t></is></c>';
-      // F-L medidas
-      var mv=[r.mes,r.pMes,r.ytd,r.pYtd,r.evMes,r.evTri,r.y25];
-      var mi=[1,0,1,0,0,0,1];
-      var colL=['F','G','H','I','J','K','L'];
-      for(var c=0;c<7;c++){ var v=mv[c]; if(v===null||v===undefined){cells+='<c r="'+colL[c]+rn+'"/>';} else {cells+='<c r="'+colL[c]+rn+'"><v>'+(mi[c]?Math.round(v):v)+'</v></c>';} }
-      rowsXml.push('<row r="'+rn+'" spans="1:12">'+cells+'</row>');
+      // F em diante: medidas, na ordem de meas
+      for(var c=0;c<meas.length;c++){ var v=meas[c].f(r), cl=colLetter(6+c); if(v===null||v===undefined){cells+='<c r="'+cl+rn+'"/>';} else {cells+='<c r="'+cl+rn+'"><v>'+(meas[c].int?Math.round(v):v)+'</v></c>';} }
+      rowsXml.push('<row r="'+rn+'" spans="1:'+(5+meas.length)+'">'+cells+'</row>');
     });
+    // cabecalho: garante as colunas novas (M..P) na linha 1 do molde
+    var lastColL=colLetter(5+meas.length);
+    rowsXml[0]=rowsXml[0].replace(/spans="[^"]+"/,'spans="1:'+(5+meas.length)+'"');
+    for(var hc=0;hc<meas.length;hc++){ var hl=colLetter(6+hc); if(rowsXml[0].indexOf('<c r="'+hl+'1"')===-1) rowsXml[0]=rowsXml[0].replace('</row>','<c r="'+hl+'1" t="inlineStr"><is><t>'+esc(meas[hc].n)+'</t></is></c></row>'); }
     var newBx=head+rowsXml.join('')+tail;
     // dimension
-    newBx=newBx.replace(/<dimension ref="[^"]+"\/>/, '<dimension ref="A1:L'+(rows.length+1)+'"/>');
+    newBx=newBx.replace(/<dimension ref="[^"]+"\/>/, '<dimension ref="A1:'+lastColL+(rows.length+1)+'"/>');
     zip.file(baseSheet,newBx);
     progress('Aba BASE atualizada',80);
 
     // ---- 5) Table1 ref (numero de linhas) ----
     try{
       var tp='xl/tables/table1.xml'; var tx=await zip.file(tp).async('string');
-      tx=tx.replace(/ref="A1:L\d+"/,'ref="A1:L'+(rows.length+1)+'"').replace(/ref="[A-L]1:[A-L]\d+"/,'ref="A1:L'+(rows.length+1)+'"');
-      tx=tx.replace(/(<autoFilter ref=")[^"]+(")/,'$1A1:L'+(rows.length+1)+'$2');
+      var tref='A1:'+lastColL+(rows.length+1);
+      tx=tx.replace(/(<table\b[^>]*\bref=")[^"]+(")/,'$1'+tref+'$2').replace(/(<autoFilter ref=")[^"]+(")/,'$1'+tref+'$2');
+      // colunas da tabela: acrescenta as medidas que o molde ainda nao tem
+      tx=tx.replace(/<tableColumns count="\d+">([\s\S]*?)<\/tableColumns>/, function(_,body){
+        var cols=body.match(/<tableColumn\b[^>]*\/>/g)||[]; var names=cols.map(function(c){return unesc((c.match(/name="([^"]*)"/)||[])[1]||'');});
+        var maxId=0; cols.forEach(function(c){ var id=parseInt((c.match(/\bid="(\d+)"/)||[])[1]||'0',10); if(id>maxId) maxId=id; });
+        meas.forEach(function(mo){ if(names.indexOf(mo.n)===-1){ maxId++; cols.push('<tableColumn id="'+maxId+'" xr3:uid="'+guid()+'" name="'+esc(mo.n)+'"/>'); } });
+        return '<tableColumns count="'+cols.length+'">'+cols.join('')+'</tableColumns>';
+      });
       zip.file(tp,tx);
     }catch(e){}
     progress('Finalizando',90);
@@ -517,10 +903,19 @@ https://github.com/nodeca/pako/blob/main/LICENSE
                 .split('MKT SHARE MAIO').join('MKT SHARE '+mesNome)
                 .split('YTD MAIO').join('YTD '+mesNome);
     }
-    for (var hi=0; hi<3; hi++){
-      var hp=['xl/pivotTables/pivotTable1.xml','xl/pivotTables/pivotTable2.xml','xl/sharedStrings.xml'][hi];
+    var hdrParts=Object.keys(zip.files).filter(function(p){return /^xl\/pivotTables\/pivotTable\d+\.xml$/.test(p);}).concat(['xl/sharedStrings.xml']);
+    for (var hi=0; hi<hdrParts.length; hi++){
+      var hp=hdrParts[hi];
       try{ var hx=await zip.file(hp).async('string'); zip.file(hp, updMes(hx)); }catch(e){}
     }
+
+    // ---- 6b) ocultar a aba BASE (fonte da Tabela1; nao pode ser excluida porque o cache le dela) ----
+    try{
+      var wbH=await zip.file('xl/workbook.xml').async('string');
+      wbH=wbH.replace(/<sheet\b([^>]*\bname="BASE"[^>]*)\/>/, function(_,a){ return '<sheet'+(/\bstate="/.test(a)?a.replace(/\bstate="[^"]*"/,'state="hidden"'):a.replace(/\bname="BASE"/,'name="BASE" state="hidden"'))+'/>'; });
+      wbH=wbH.replace(/(<workbookView\b[^>]*)\bactiveTab="\d+"/, '$1activeTab="0"');
+      zip.file('xl/workbook.xml', wbH);
+    }catch(e){}
 
     // ---- 7) gerar xlsx ----
     var out=await zip.generateAsync({type:(typeof window!=='undefined'?'blob':'nodebuffer'),compression:'DEFLATE'});
@@ -538,7 +933,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     return 'xl/worksheets/sheet3.xml';
   }
 
-  var api={build:build};
+  var api={build:build, cloneRankingView:cloneRankingView, upgradeShareFields:upgradeShareFields, highlightMarcaRows:highlightMarcaRows, ensureSheetLike:ensureSheetLike};
   if(typeof module!=='undefined'&&module.exports) module.exports=api;
   global.RankBuilder=api;
 })(typeof window!=='undefined'?window:globalThis);
